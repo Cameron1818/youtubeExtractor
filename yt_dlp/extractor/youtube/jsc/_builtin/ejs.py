@@ -5,11 +5,8 @@ import dataclasses
 import enum
 import functools
 import hashlib
-import importlib.resources
 import json
-import sys
 
-import yt_dlp
 from yt_dlp.dependencies import yt_dlp_ejs as _has_ejs
 from yt_dlp.extractor.youtube.jsc._builtin import vendor
 from yt_dlp.extractor.youtube.jsc.provider import (
@@ -22,6 +19,7 @@ from yt_dlp.extractor.youtube.jsc.provider import (
     NChallengeOutput,
     SigChallengeOutput,
 )
+from yt_dlp.extractor.youtube.pot._provider import configuration_arg
 from yt_dlp.extractor.youtube.pot.provider import provider_bug_report_message
 from yt_dlp.utils._jsruntime import JsRuntimeInfo
 
@@ -33,6 +31,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     from yt_dlp.extractor.youtube.jsc.provider import JsChallengeRequest
+
+_EJS_WIKI_URL = 'https://github.com/yt-dlp/yt-dlp/wiki/EJS'
 
 
 class ScriptType(enum.Enum):
@@ -49,11 +49,10 @@ class ScriptVariant(enum.Enum):
 
 
 class ScriptSource(enum.Enum):
-    PYPACKAGE = 'python package'
-    BINARY = 'binary'
-    CACHE = 'cache'
-    WEB = 'web'
-    BUILTIN = 'builtin'
+    PYPACKAGE = 'python package'  # PyPI, PyInstaller exe, zipimport binary, etc
+    CACHE = 'cache'  # GitHub release assets (cached)
+    WEB = 'web'  # GitHub release assets (downloaded)
+    BUILTIN = 'builtin'  # vendored (full core script; import-only lib script + NPM cache)
 
 
 @dataclasses.dataclass
@@ -72,7 +71,7 @@ class Script:
         return f'<Script {self.type.value!r} v{self.version} (source: {self.source.value}) variant={self.variant.value!r} size={len(self.code)} hash={self.hash[:7]}...>'
 
 
-class JsRuntimeChalBaseJCP(JsChallengeProvider):
+class EJSBaseJCP(JsChallengeProvider):
     JS_RUNTIME_NAME: str
     _CACHE_SECTION = 'challenge-solver'
 
@@ -109,27 +108,30 @@ class JsRuntimeChalBaseJCP(JsChallengeProvider):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._available = True
+        self.ejs_settings = self.ie.get_param('extractor_args', {}).get('youtube-ejs', {})
 
-        # Note: developer use only, intentionally not documented.
+        # Note: The following 3 args are for developer use only & intentionally not documented.
         # - dev: bypasses verification of script hashes and versions.
         # - repo: use a custom GitHub repository to fetch web script from.
         # - script_version: use a custom script version.
-        # E.g. --extractor-args "youtubejsc-ejs:dev=true;script_version=0.1.4"
-        self.ejs_settings = self.ie.get_param('extractor_args', {}).get('youtubejsc-ejs', {})
+        # E.g. --extractor-args "youtube-ejs:dev=true;script_version=0.1.4"
 
-        self.is_dev = self.ejs_settings.get('dev', []) == ['true']
+        self.is_dev = self.ejs_setting('dev', ['false'])[0] == 'true'
         if self.is_dev:
             self.report_dev_option('You have enabled dev mode for EJS JCP Providers.')
 
-        custom_repo = self.ejs_settings.get('repo', [None])[0]
+        custom_repo = self.ejs_setting('repo', [None])[0]
         if custom_repo:
             self.report_dev_option(f'You have set a custom GitHub repository for EJS JCP Providers ({custom_repo}).')
             self._REPOSITORY = custom_repo
 
-        custom_version = self.ejs_settings.get('script_version', [None])[0]
+        custom_version = self.ejs_setting('script_version', [None])[0]
         if custom_version:
             self.report_dev_option(f'You have set a custom EJS script version for EJS JCP Providers ({custom_version}).')
             self._SCRIPT_VERSION = custom_version
+
+    def ejs_setting(self, key, *args, **kwargs):
+        return configuration_arg(self.ejs_settings, key, *args, **kwargs)
 
     def report_dev_option(self, message: str):
         self.ie.report_warning(
@@ -158,6 +160,9 @@ class JsRuntimeChalBaseJCP(JsChallengeProvider):
                 cached = False
                 video_id = next((request.video_id for request in grouped_requests), None)
                 player = self._get_player(video_id, player_url)
+
+            # NB: This output belongs after the player request
+            self.logger.info(f'Solving JS challenges using {self.JS_RUNTIME_NAME}')
 
             stdin = self._construct_stdin(player, cached, grouped_requests)
             stdout = self._run_js_runtime(stdin)
@@ -209,32 +214,49 @@ class JsRuntimeChalBaseJCP(JsChallengeProvider):
         return self._get_script(ScriptType.CORE)
 
     def _get_script(self, script_type: ScriptType, /) -> Script:
+        skipped_components: list[_SkippedComponent] = []
         for _, from_source in self._iter_script_sources():
             script = from_source(script_type)
             if not script:
                 continue
-            if not self.is_dev and script.version != self._SCRIPT_VERSION:
-                self.logger.warning(
-                    f'Challenge solver {script_type.value} script version {script.version} '
-                    f'is not supported (source: {script.source.value}, variant: {script.variant}, supported version: {self._SCRIPT_VERSION})')
-            script_hashes = self._ALLOWED_HASHES[script.type].get(script.variant, [])
-            if not self.is_dev and script_hashes and script.hash not in script_hashes:
-                self.logger.warning(
-                    f'Hash mismatch on challenge solver {script.type.value} script '
-                    f'(source: {script.source.value}, variant: {script.variant}, hash: {script.hash})!{provider_bug_report_message(self)}')
-            else:
-                self.logger.debug(
-                    f'Using challenge solver {script.type.value} script v{script.version} '
-                    f'(source: {script.source.value}, variant: {script.variant.value})')
-                return script
+            if isinstance(script, _SkippedComponent):
+                skipped_components.append(script)
+                continue
+            if not self.is_dev:
+                if script.version != self._SCRIPT_VERSION:
+                    self.logger.warning(
+                        f'Challenge solver {script_type.value} script version {script.version} '
+                        f'is not supported (source: {script.source.value}, variant: {script.variant}, supported version: {self._SCRIPT_VERSION})')
+                    if script.source is ScriptSource.CACHE:
+                        self.logger.debug('Clearing outdated cached script')
+                        self.ie.cache.store(self._CACHE_SECTION, script_type.value, None)
+                    continue
+                script_hashes = self._ALLOWED_HASHES[script.type].get(script.variant, [])
+                if script_hashes and script.hash not in script_hashes:
+                    self.logger.warning(
+                        f'Hash mismatch on challenge solver {script.type.value} script '
+                        f'(source: {script.source.value}, variant: {script.variant}, hash: {script.hash})!{provider_bug_report_message(self)}')
+                    if script.source is ScriptSource.CACHE:
+                        self.logger.debug('Clearing invalid cached script')
+                        self.ie.cache.store(self._CACHE_SECTION, script_type.value, None)
+                    continue
+            self.logger.debug(
+                f'Using challenge solver {script.type.value} script v{script.version} '
+                f'(source: {script.source.value}, variant: {script.variant.value})')
+            break
 
-        self._available = False
-        raise JsChallengeProviderRejectedRequest(f'No usable challenge solver {script_type.value} script available')
+        else:
+            self._available = False
+            raise JsChallengeProviderRejectedRequest(
+                f'No usable challenge solver {script_type.value} script available',
+                _skipped_components=skipped_components or None,
+            )
+
+        return script
 
     def _iter_script_sources(self) -> Generator[tuple[ScriptSource, Callable[[ScriptType], Script | None]]]:
         yield from [
             (ScriptSource.PYPACKAGE, self._pypackage_source),
-            (ScriptSource.BINARY, self._binary_source),
             (ScriptSource.CACHE, self._cached_source),
             (ScriptSource.BUILTIN, self._builtin_source),
             (ScriptSource.WEB, self._web_release_source)]
@@ -250,14 +272,6 @@ class JsRuntimeChalBaseJCP(JsChallengeProvider):
             return None
         return Script(script_type, ScriptVariant.MINIFIED, ScriptSource.PYPACKAGE, yt_dlp_ejs.version, code)
 
-    def _binary_source(self, script_type: ScriptType, /) -> Script | None:
-        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            file = importlib.resources.files(yt_dlp) / self._MIN_SCRIPT_FILENAMES[script_type]
-            if file.is_file():
-                code = file.read_text(encoding='utf-8')
-                return Script(script_type, ScriptVariant.MINIFIED, ScriptSource.BINARY, self._SCRIPT_VERSION, code)
-        return None
-
     def _cached_source(self, script_type: ScriptType, /) -> Script | None:
         if data := self.ie.cache.load(self._CACHE_SECTION, script_type.value):
             return Script(script_type, ScriptVariant(data['variant']), ScriptSource.CACHE, data['version'], data['code'])
@@ -272,10 +286,9 @@ class JsRuntimeChalBaseJCP(JsChallengeProvider):
             return Script(script_type, ScriptVariant.UNMINIFIED, ScriptSource.BUILTIN, self._SCRIPT_VERSION, code)
         return None
 
-    def _web_release_source(self, script_type: ScriptType, /) -> Script | None:
+    def _web_release_source(self, script_type: ScriptType, /):
         if 'ejs:github' not in (self.ie.get_param('remote_components') or ()):
-            self._report_remote_component_skipped('ejs:github', 'challenge solver script')
-            return None
+            return self._skip_component('ejs:github')
         url = f'https://github.com/{self._REPOSITORY}/releases/download/{self._SCRIPT_VERSION}/{self._MIN_SCRIPT_FILENAMES[script_type]}'
         if code := self.ie._download_webpage_with_retries(
             url, None, f'[{self.logger.prefix}] Downloading challenge solver {script_type.value} script from  {url}',
@@ -303,9 +316,11 @@ class JsRuntimeChalBaseJCP(JsChallengeProvider):
             return False
         return self._available
 
-    def _report_remote_component_skipped(self, component: str, component_description: str):
-        self.logger.warning(
-            f'Remote {component_description} downloads are disabled. '
-            f'This may be required to solve JS challenges using {self.JS_RUNTIME_NAME} JS runtime. '
-            f'You can enable {component_description} downloads with "--remote-components {component}". '
-            f'For more information and alternatives, refer to  {self.ie._EJS_WIKI_URL}')
+    def _skip_component(self, component: str, /):
+        return _SkippedComponent(component, self.JS_RUNTIME_NAME)
+
+
+@dataclasses.dataclass
+class _SkippedComponent:
+    component: str
+    runtime: str

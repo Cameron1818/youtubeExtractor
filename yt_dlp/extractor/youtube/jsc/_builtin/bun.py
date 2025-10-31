@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import urllib.parse
 
-from yt_dlp.extractor.youtube.jsc._builtin.runtime import (
-    JsRuntimeChalBaseJCP,
+from yt_dlp.extractor.youtube.jsc._builtin.ejs import (
+    _EJS_WIKI_URL,
+    EJSBaseJCP,
     Script,
     ScriptSource,
     ScriptType,
@@ -16,7 +18,6 @@ from yt_dlp.extractor.youtube.jsc._builtin.vendor import load_script
 from yt_dlp.extractor.youtube.jsc.provider import (
     JsChallengeProvider,
     JsChallengeProviderError,
-    JsChallengeProviderRejectedRequest,
     JsChallengeRequest,
     register_preference,
     register_provider,
@@ -33,29 +34,34 @@ from yt_dlp.utils.networking import HTTPHeaderDict, clean_proxies
 # - No sandboxing options available
 # - Cannot detect if npm packages are cached without potentially downloading them.
 #   `--no-install` appears to disable the cache.
+# - npm auto-install may fail with an integrity error when using HTTP proxies
+# - npm auto-install HTTP proxy support may be limited on older Bun versions
 
 
 @register_provider
-class BunJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
+class BunJCP(EJSBaseJCP, BuiltinIEContentProvider):
     PROVIDER_NAME = 'bun'
     JS_RUNTIME_NAME = 'bun'
     BUN_NPM_LIB_FILENAME = 'yt.solver.bun.lib.js'
     SUPPORTED_PROXY_SCHEMES = ['http', 'https']
 
     def _iter_script_sources(self):
-        for source, func in super()._iter_script_sources():
-            if source == ScriptSource.WEB:
-                # Prioritize GitHub scripts over Bun NPM script as bun NPM auto-install is unreliable.
-                yield source, func
-                yield ScriptSource.BUILTIN, self._bun_npm_source
-            else:
-                yield source, func
+        yield from super()._iter_script_sources()
+        yield ScriptSource.BUILTIN, self._bun_npm_source
 
-    def _bun_npm_source(self, script_type: ScriptType, /) -> Script | None:
+    def _bun_npm_source(self, script_type: ScriptType, /):
         if script_type != ScriptType.LIB:
             return None
         if 'ejs:npm' not in self.ie.get_param('remote_components', []):
-            self._report_remote_component_skipped('ejs:npm', 'NPM package')
+            return self._skip_component('ejs:npm')
+
+        # Check to see if the environment proxies are compatible with Bun npm source
+        if unsupported_scheme := self._check_env_proxies(self._get_env_options()):
+            self.logger.warning(
+                f'Bun NPM package downloads only support HTTP/HTTPS proxies; skipping remote NPM package downloads. '
+                f'Provide another distribution of the challenge solver script or use '
+                f'another JS runtime that supports "{unsupported_scheme}" proxies. '
+                f'For more information and alternatives, refer to  {_EJS_WIKI_URL}')
             return None
 
         # Bun-specific lib scripts that uses Bun autoimport
@@ -66,6 +72,17 @@ class BunJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
             self.BUN_NPM_LIB_FILENAME, error_hook=error_hook)
         if code:
             return Script(script_type, ScriptVariant.BUN_NPM, ScriptSource.BUILTIN, self._SCRIPT_VERSION, code)
+        return None
+
+    def _check_env_proxies(self, env):
+        # check that the schemes of both HTTP_PROXY and HTTPS_PROXY are supported
+        for key in ('HTTP_PROXY', 'HTTPS_PROXY'):
+            proxy = env.get(key)
+            if not proxy:
+                continue
+            scheme = urllib.parse.urlparse(proxy).scheme.lower()
+            if scheme not in self.SUPPORTED_PROXY_SCHEMES:
+                return scheme
         return None
 
     def _get_env_options(self) -> dict[str, str]:
@@ -80,26 +97,14 @@ class BunJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
             val = request_proxies.get(key)
             if val is not None:
                 options[env] = val
-
-        # check that the schemes of both HTTP_PROXY and HTTPS_PROXY are supported
-        for env in ('HTTP_PROXY', 'HTTPS_PROXY'):
-            proxy = options.get(env)
-            if not proxy:
-                continue
-            scheme = urllib.parse.urlparse(proxy).scheme.lower()
-            if scheme not in self.SUPPORTED_PROXY_SCHEMES:
-                scheme = urllib.parse.urlparse(proxy).scheme.lower()
-                self.logger.warning(
-                    f'Bun NPM requests only support HTTP/HTTPS proxies; skipping provider. '
-                    f'Provide another distribution of the challenge solver script or use '
-                    f'another JS runtime that supports "{scheme}" proxies (e.g. deno). '
-                    f'For more information, refer to  {self.ie._EJS_WIKI_URL}')
-                raise JsChallengeProviderRejectedRequest(
-                    f'External requests by "{self.PROVIDER_NAME}" provider do not '
-                    f'support proxy scheme "{scheme}". Supported proxy schemes: '
-                    f'{", ".join(self.SUPPORTED_PROXY_SCHEMES)}.')
         if self.ie.get_param('nocheckcertificate'):
             options['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
+
+        # Prevent segfault: <https://github.com/oven-sh/bun/issues/22901>
+        options.pop('JSC_useJIT', None)
+        if self.ejs_setting('jitless', ['false']) != ['false']:
+            options['BUN_JSC_useJIT'] = '0'
+
         return options
 
     def _run_js_runtime(self, stdin: str, /) -> str:
@@ -122,12 +127,18 @@ class BunJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
             env=self._get_env_options(),
         ) as proc:
             stdout, stderr = proc.communicate_or_kill(stdin)
+            stderr = self._clean_stderr(stderr)
             if proc.returncode or stderr:
-                msg = 'Error running bun process'
+                msg = f'Error running bun process (returncode: {proc.returncode})'
                 if stderr:
-                    msg = f'{msg}: {stderr}'
+                    msg = f'{msg}: {stderr.strip()}'
                 raise JsChallengeProviderError(msg)
         return stdout
+
+    def _clean_stderr(self, stderr):
+        return '\n'.join(
+            line for line in stderr.splitlines()
+            if not re.match(r'^Bun v\d+\.\d+\.\d+ \([\w\s]+\)$', line))
 
 
 @register_preference(BunJCP)

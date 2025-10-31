@@ -43,6 +43,7 @@ from .globals import (
     all_plugins_loaded,
     plugin_dirs,
     supported_js_runtimes,
+    supported_remote_components,
 )
 from .minicurses import format_text
 from .networking import HEADRequest, Request, RequestDirector
@@ -536,6 +537,7 @@ class YoutubeDL:
                        E.g. {'youtube': {'skip': ['dash', 'hls']}}
     js_runtimes:       A dictionary of JavaScript runtime keys (in lower case) to enable
                        and a dictionary of additional configuration for the runtime.
+                       Currently supported runtimes are 'deno', 'node', 'bun', and 'quickjs'.
                        If None, the default runtime of "deno" will be enabled.
                        The runtime configuration dictionary can have the following keys:
                         - path: Path to the executable (optional)
@@ -733,6 +735,9 @@ class YoutubeDL:
         self.params['js_runtimes'] = self.params.get('js_runtimes', {'deno': {}})
         self._clean_js_runtimes(self.params['js_runtimes'])
 
+        self.params['remote_components'] = set(self.params.get('remote_components', ()))
+        self._clean_remote_components(self.params['remote_components'])
+
         self.params['compat_opts'] = set(self.params.get('compat_opts', ()))
         self.params['http_headers'] = HTTPHeaderDict(std_headers, self.params.get('http_headers'))
         self._load_cookies(self.params['http_headers'].get('Cookie'))  # compat
@@ -858,6 +863,14 @@ class YoutubeDL:
                 f' Supported runtimes: {", ".join(supported_js_runtimes.value.keys())}.')
             for rt in unsupported_runtimes:
                 runtimes.pop(rt)
+
+    def _clean_remote_components(self, remote_components: set):
+        if unsupported_remote_components := set(remote_components) - set(supported_remote_components.value):
+            self.report_warning(
+                f'Ignoring unsupported remote component(s): {", ".join(unsupported_remote_components)}.'
+                f' Supported remote components: {", ".join(supported_remote_components.value)}.')
+            for rt in unsupported_remote_components:
+                remote_components.remove(rt)
 
     @functools.cached_property
     def _js_runtimes(self):
