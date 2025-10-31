@@ -5,8 +5,8 @@ import re
 import shlex
 import subprocess
 
-from yt_dlp.extractor.youtube.jsc._builtin.runtime import (
-    JsRuntimeChalBaseJCP,
+from yt_dlp.extractor.youtube.jsc._builtin.ejs import (
+    EJSBaseJCP,
     Script,
     ScriptSource,
     ScriptType,
@@ -27,7 +27,7 @@ from yt_dlp.utils.networking import HTTPHeaderDict, clean_proxies
 
 
 @register_provider
-class DenoJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
+class DenoJCP(EJSBaseJCP, BuiltinIEContentProvider):
     PROVIDER_NAME = 'deno'
     JS_RUNTIME_NAME = 'deno'
 
@@ -36,15 +36,13 @@ class DenoJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
     _NPM_PACKAGES_CACHED = False
 
     def _iter_script_sources(self):
-        for source, func in super()._iter_script_sources():
-            if source == ScriptSource.WEB:
-                yield ScriptSource.BUILTIN, self._deno_npm_source
-            yield source, func
+        yield from super()._iter_script_sources()
+        yield ScriptSource.BUILTIN, self._deno_npm_source
 
-    def _deno_npm_source(self, script_type: ScriptType, /) -> Script | None:
+    def _deno_npm_source(self, script_type: ScriptType, /):
         if script_type != ScriptType.LIB:
             return None
-        # Deno-specific lib scripts that uses Deno NPM imports
+        # Deno-specific lib scripts that use Deno NPM imports
         error_hook = lambda e: self.logger.warning(
             f'Failed to read deno challenge solver lib script: {e}{provider_bug_report_message(self)}')
         code = load_script(
@@ -55,8 +53,7 @@ class DenoJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
             # We may still be able to continue if the npm packages are available/cached
             self._NPM_PACKAGES_CACHED = self._npm_packages_cached(code)
             if not self._NPM_PACKAGES_CACHED:
-                self._report_remote_component_skipped('ejs:npm', 'NPM package')
-                return None
+                return self._skip_component('ejs:npm')
         return Script(script_type, ScriptVariant.DENO_NPM, ScriptSource.BUILTIN, self._SCRIPT_VERSION, code)
 
     def _npm_packages_cached(self, stdin: str) -> bool:
@@ -78,6 +75,9 @@ class DenoJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
             options.append('--cached-only')
         if self.ie.get_param('nocheckcertificate'):
             options.append('--unsafely-ignore-certificate-errors')
+        # XXX: Convert this extractor-arg into a general option if/when a JSI framework is implemented
+        if self.ejs_setting('jitless', ['false']) != ['false']:
+            options.append('--v8-flags=--jitless')
         return self._run_deno(stdin, options)
 
     def _get_env_options(self) -> dict[str, str]:
@@ -108,7 +108,7 @@ class DenoJCP(JsRuntimeChalBaseJCP, BuiltinIEContentProvider):
             if proc.returncode or stderr:
                 msg = f'Error running deno process (returncode: {proc.returncode})'
                 if stderr:
-                    msg = f'{msg}: {stderr}'
+                    msg = f'{msg}: {stderr.strip()}'
                 raise JsChallengeProviderError(msg)
         return stdout
 
